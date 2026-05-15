@@ -46,6 +46,10 @@ Dockerfile    ← Alpine + Python3 + nvme-cli + docker-cli (~30MB)
 
 All hardware paths are probed dynamically — no hardcoded hwmon indices. Sensor discovery is lazy (built on first API call), so it survives container restarts cleanly.
 
+## Disclaimer
+
+This is an **unofficial community project**. Not affiliated with, endorsed by, or connected to Radxa Computer Co., Ltd. The Radxa logo and name are used for identification purposes only. All trademarks belong to their respective owners.
+
 ## License
 
 MIT
