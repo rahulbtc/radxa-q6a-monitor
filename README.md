@@ -2,6 +2,9 @@
 
 Real-time hardware telemetry dashboard for the **Radxa Q6A** (Qualcomm QCS6490). Single-file Python server, zero Python dependencies beyond the standard library. Built for headless deployments where you need at-a-glance system health without SSH.
 
+OS Tested on:
+Official Ubuntu - ARM from Radxa.
+
 Single HTML page, auto-refreshing every 2 seconds, dark-themed, no JavaScript frameworks.
 
 ## What it monitors
