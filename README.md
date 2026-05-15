@@ -23,7 +23,12 @@ Port **3999**.
 
 ## Screenshots
 
-> _Coming soon — or just build it and see, it takes 10 seconds._
+Desktop Homepage:
+<img width="1919" height="1114" alt="image" src="https://github.com/user-attachments/assets/6b09786d-214e-4033-bc2e-a5baee79d32d" />
+
+Mobile Homepage:
+<img width="509" height="983" alt="image" src="https://github.com/user-attachments/assets/0ea14fa7-33c5-431e-aa19-61c6c379d206" />
+
 
 ## Quick Start
 
