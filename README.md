@@ -30,8 +30,15 @@ Port **3999**.
 Desktop Homepage:
 <img width="1919" height="1114" alt="image" src="https://github.com/user-attachments/assets/6b09786d-214e-4033-bc2e-a5baee79d32d" />
 
+
+True Black (AMOLED Theme):
+<img width="1916" height="1195" alt="image" src="https://github.com/user-attachments/assets/e82f34f6-8fac-4de4-84b3-56d6942d8f25" />
+
+
 Mobile Homepage:
+
 <img width="509" height="983" alt="image" src="https://github.com/user-attachments/assets/0ea14fa7-33c5-431e-aa19-61c6c379d206" />
+
 
 
 ## Quick Start
