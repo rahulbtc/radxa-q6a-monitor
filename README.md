@@ -5,7 +5,7 @@ Real-time hardware telemetry dashboard for the **Radxa Q6A** (Qualcomm QCS6490).
 OS Tested on:
 Official Ubuntu - ARM from Radxa.
 
-Single HTML page, auto-refreshing every 2 seconds, dark-themed, no JavaScript frameworks.
+Single HTML page, real-time streaming via Server-Sent Events (SSE), dark-themed (with True AMOLED toggle), no heavy JavaScript frameworks.
 
 ## What it monitors
 
@@ -14,6 +14,7 @@ Single HTML page, auto-refreshing every 2 seconds, dark-themed, no JavaScript fr
 | **CPU** | 8 cores (4× Silver A55, 3× Gold A78, 1× Prime A78+), per-core freq/temp/usage/governor |
 | **GPU** | Adreno 643 — frequency, governor, dual thermal sensors |
 | **NPU** | Hexagon v68 DSP — ADSP/CDSP state, FastRPC devices, thermal |
+| **AI Agent** | QNN/ONNX backend status, embedding throughput, ChromaDB metrics |
 | **RAM** | Usage, cached, buffers, swap, zram compression ratios |
 | **Disk** | NVMe health (SMART), I/O throughput, temperature sensors |
 | **Network** | Per-interface throughput, IPs, DNS/ping connectivity checks |
@@ -64,9 +65,10 @@ Dockerfile    ← Alpine 3.21 + python3 + nvme-cli + docker-cli (~30MB image)
 docker-compose.yml
 ```
 
-The dashboard has two endpoints:
+The dashboard has endpoints:
 - `GET /` — serves the HTML UI (embedded in `dashboard.py`, no static files)
-- `GET /api` — returns JSON with all system stats
+- `GET /stream` — real-time telemetry stream via Server-Sent Events (SSE)
+- `GET /api` — returns the latest snapshot as JSON
 
 ### Hardware Discovery
 

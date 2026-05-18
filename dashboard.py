@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
 """Radxa Q6A Monitor — Qualcomm QCS6490 — Port 3999."""
-import json, subprocess, os, time, re
+import json, subprocess, os, time, re, signal, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
 
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 PORT = 3999
 HISTORY = 120  # ~4min at 2s intervals
+
+LATEST_STATS = "{}"
+STATS_EVENT = threading.Event()
+
+def stats_loop():
+    global LATEST_STATS
+    while True:
+        try:
+            LATEST_STATS = json.dumps(get_stats())
+            STATS_EVENT.set()
+            STATS_EVENT.clear()
+        except Exception:
+            pass
+        time.sleep(2)
+
 
 # ── History buffers ──
 cpu_hist = deque(maxlen=HISTORY)
@@ -16,6 +32,8 @@ net_tx_hist = deque(maxlen=HISTORY)
 disk_r_hist = deque(maxlen=HISTORY)
 disk_w_hist = deque(maxlen=HISTORY)
 temp_hist = deque(maxlen=HISTORY)
+npu_util_hist = deque(maxlen=HISTORY)
+npu_latency_hist = deque(maxlen=HISTORY)
 
 prev_net = {"rx": 0, "tx": 0, "ts": 0}
 prev_disk = {"r": 0, "w": 0, "ts": 0}
@@ -258,6 +276,70 @@ def get_stats():
         t1 = hwmon_int("nspss1_thermal")
         npu["temp"] = round(t0 / 1000, 1) if t0 else None
         npu["temp2"] = round(t1 / 1000, 1) if t1 else None
+
+        # FastRPC process tracking — who has the DSP open
+        fastrpc_procs = []
+        dsp_active = False
+        try:
+            for pid_s in os.listdir("/proc"):
+                if not pid_s.isdigit() or int(pid_s) == os.getpid():
+                    continue
+                try:
+                    fd_dir = f"/proc/{pid_s}/fd"
+                    for fd in os.listdir(fd_dir):
+                        link = os.readlink(f"{fd_dir}/{fd}")
+                        if "fastrpc-cdsp" in link:
+                            comm = read_file(f"/proc/{pid_s}/comm") or "?"
+                            fastrpc_procs.append({"pid": int(pid_s), "comm": comm})
+                            dsp_active = True
+                            break
+                except (PermissionError, OSError):
+                    pass
+        except Exception:
+            pass
+        npu["fastrpc_procs"] = fastrpc_procs
+        npu["dsp_active"] = dsp_active
+
+        # AI Agent inference metrics (port 4210)
+        agent = {"available": False}
+        try:
+            import urllib.request
+            with urllib.request.urlopen("http://localhost:4210/api/health", timeout=2) as resp:
+                ah = json.loads(resp.read())
+                agent["available"] = ah.get("status") == "ok"
+                agent["npu_enabled"] = ah.get("npu", False)
+            with urllib.request.urlopen("http://localhost:4210/api/kb/status", timeout=2) as resp:
+                kb = json.loads(resp.read())
+                agent["total_chunks"] = kb.get("total_documents", 0)
+                agent["unique_symbols"] = kb.get("unique_symbols", 0)
+                job = kb.get("job", {})
+                agent["indexer_running"] = job.get("status") in ("running", "paused")
+                agent["processed"] = job.get("processed", 0)
+                agent["total_files"] = job.get("total_files", 0)
+                agent["chunks_per_min"] = round(job.get("throughput_chunks_per_min", 0), 1)
+            with urllib.request.urlopen("http://localhost:4210/api/kb/metrics", timeout=2) as resp:
+                m = json.loads(resp.read())
+                agent["embed_per_sec"] = m.get("throughput", {}).get("embeddings_per_sec", 0)
+                agent["processed_today"] = m.get("throughput", {}).get("processed_today", 0)
+                agent["processed_hour"] = m.get("throughput", {}).get("processed_last_hour", 0)
+                st = m.get("stage_timing", {})
+                agent["embed_avg_ms"] = st.get("embed", {}).get("avg_ms", 0)
+                agent["extract_avg_ms"] = st.get("extract", {}).get("avg_ms", 0)
+        except Exception:
+            pass
+        npu["agent"] = agent
+
+        # Synthetic utilization estimate
+        # Embedding throughput → how busy is the inference pipeline
+        cpm = agent.get("chunks_per_min", 0)
+        embed_ms = agent.get("embed_avg_ms", 0) or 46  # default CPU estimate
+        if cpm > 0:
+            busy_frac = min(1.0, (cpm * embed_ms) / 60000)
+            npu["inferred_util"] = round(busy_frac * 100, 1)
+        else:
+            npu["inferred_util"] = 0
+        npu_util_hist.append(npu["inferred_util"])
+        npu_latency_hist.append(embed_ms if embed_ms and cpm > 0 else 0)
     except Exception:
         pass
     s["npu"] = npu
@@ -519,7 +601,7 @@ def get_stats():
     s["net"] = net
 
     # IPs
-    s["ip_lan"] = run("hostname -I 2>/dev/null | awk '{print $1}'") or "?"
+    s["ip_lan"] = run("ip route get 1.1.1.1 2>/dev/null | awk '{print $7}'") or run("hostname -I 2>/dev/null | awk '{print $1}'") or ""
     s["ip_tailscale"] = run("tailscale ip -4 2>/dev/null") or "—"
 
     # DNS checks
@@ -720,6 +802,8 @@ def get_stats():
         "disk_r": list(disk_r_hist),
         "disk_w": list(disk_w_hist),
         "temp": list(temp_hist),
+        "npu_util": list(npu_util_hist),
+        "npu_latency": list(npu_latency_hist),
     }
     return s
 
@@ -731,6 +815,9 @@ DASHBOARD = r"""<!DOCTYPE html>
 <title>Radxa Q6A System Monitor</title>
 <style>
 :root{--bg:#0a0e14;--surface:#111921;--border:#1a2332;--text:#c5cdd8;--dim:#4a5568;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--orange:#f0883e;--cyan:#39c5cf;--purple:#bc8cff}
+:root.amoled{--bg:#000;--surface:#080808;--border:#151515;--text:#d0d0d0;--dim:#555;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--orange:#f0883e;--cyan:#39c5cf;--purple:#bc8cff}
+.theme-btn{background:none;border:1px solid var(--border);color:var(--dim);border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;vertical-align:middle;margin-left:8px}
+.theme-btn:hover{color:var(--text);border-color:var(--accent)}
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:13px;line-height:1.4;-webkit-font-smoothing:antialiased}
 .wrap{max-width:100%;margin:0 auto;padding:0 12px 40px}
@@ -815,13 +902,20 @@ canvas{width:100%;height:48px;display:block;margin:4px 0}
 <div class="wrap">
 <header>
 <h1><svg viewBox="0 0 150 40" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_20334_14003)"><path d="M4.27206 39.9998H0V21.3617C0 19.036 0.923619 16.8056 2.56767 15.1611C4.21173 13.5166 6.44154 12.5928 8.76658 12.5928H15.8812C16.7957 12.5928 17.6727 12.9562 18.3194 13.603C18.966 14.2498 19.3293 15.1271 19.3293 16.0418V19.7134H8.76658C8.32955 19.7134 7.91041 19.8871 7.60137 20.1962C7.29234 20.5053 7.11873 20.9245 7.11873 21.3617V37.1524C7.11764 37.9072 6.81737 38.6308 6.28376 39.1646C5.75014 39.6984 5.02671 39.9987 4.27206 39.9998Z" fill="#74BC1F"/><path d="M68.7968 40H60.2156C59.0645 40 57.9248 39.7732 56.8614 39.3324C55.798 38.8917 54.8319 38.2457 54.0181 37.4314C53.2044 36.6171 52.5591 35.6504 52.1189 34.5865C51.6788 33.5226 51.4526 32.3824 51.4531 31.2311V21.3413C51.4526 20.1899 51.6788 19.0498 52.1189 17.9859C52.5591 16.922 53.2044 15.9553 54.0181 15.141C54.8319 14.3267 55.798 13.6807 56.8614 13.2399C57.9248 12.7992 59.0645 12.5724 60.2156 12.5724H64.1045C64.5599 12.5707 65.0111 12.6594 65.432 12.8334C65.8529 13.0073 66.2352 13.263 66.5566 13.5857C66.878 13.9084 67.1323 14.2916 67.3047 14.7133C67.4771 15.1349 67.5642 15.5865 67.5609 16.042V19.7136H60.2279C59.7909 19.7136 59.3718 19.8873 59.0627 20.1964C58.7537 20.5055 58.5801 20.9247 58.5801 21.3619V31.2517C58.5801 31.6888 58.7537 32.1081 59.0627 32.4172C59.3718 32.7263 59.7909 32.9 60.2279 32.9H68.7968C69.2338 32.9 69.653 32.7263 69.962 32.4172C70.271 32.1081 70.4446 31.6888 70.4446 31.2517V0H74.1152C75.0297 0 75.9068 0.363382 76.5534 1.01021C77.2001 1.65703 77.5634 2.53431 77.5634 3.44906V31.2311C77.5639 32.3828 77.3375 33.5233 76.8972 34.5874C76.4568 35.6516 75.8111 36.6185 74.9969 37.4328C74.1827 38.2472 73.2161 38.8931 72.1523 39.3336C71.0884 39.7741 69.9482 40.0005 68.7968 40Z" fill="#74BC1F"/><path d="M88.9473 13.4381L95.5387 21.7578L91.1472 26.1423L80.5432 17.7484C80.537 17.7426 80.532 17.7356 80.5286 17.7278C80.5252 17.72 80.5234 17.7115 80.5234 17.703C80.5234 17.6945 80.5252 17.6861 80.5286 17.6783C80.532 17.6705 80.537 17.6635 80.5432 17.6577L85.2149 12.9807C85.4509 12.7441 85.7344 12.5602 86.0467 12.4412C86.3589 12.3222 86.6928 12.2707 87.0264 12.2901C87.36 12.3096 87.6857 12.3996 87.982 12.5541C88.2783 12.7087 88.5385 12.9243 88.7454 13.1867L88.9473 13.4381Z" fill="#74BC1F"/><path d="M82.8321 32.7231L91.1497 26.1299L95.533 30.5143C93.8851 32.5747 90.9478 36.2834 88.7438 39.0937C88.537 39.3545 88.2773 39.5685 87.982 39.7218C87.6866 39.8751 87.3622 39.9642 87.03 39.9833C86.6977 40.0023 86.3653 39.9509 86.0543 39.8324C85.7433 39.7139 85.4609 39.531 85.2256 39.2956L80.4922 34.5733L82.8321 32.7231Z" fill="#74BC1F"/><path d="M102.107 38.8417L95.5156 30.5261L99.8989 26.1416L110.511 34.5314C110.517 34.5376 110.522 34.5449 110.526 34.5531C110.529 34.5612 110.531 34.57 110.531 34.5788C110.531 34.5877 110.529 34.5964 110.526 34.6045C110.522 34.6127 110.517 34.6201 110.511 34.6262L105.839 39.3032C105.603 39.5392 105.319 39.7226 105.007 39.8412C104.695 39.9599 104.361 40.0111 104.028 39.9917C103.695 39.9722 103.369 39.8825 103.073 39.7283C102.777 39.5742 102.516 39.3591 102.309 39.0972L102.107 38.8417Z" fill="#74BC1F"/><path d="M108.224 19.5573L99.9067 26.1504L95.5234 21.7577L102.267 13.2402C102.474 12.9643 102.739 12.737 103.043 12.5739C103.347 12.4108 103.683 12.316 104.027 12.296C104.371 12.276 104.716 12.3313 105.037 12.4581C105.357 12.5848 105.647 12.78 105.884 13.03L110.56 17.7194L108.224 19.5573Z" fill="#74BC1F"/><path d="M129.766 12.5928H117.514C116.599 12.5928 115.722 12.9562 115.076 13.603C114.429 14.2498 114.066 15.1271 114.066 16.0418V19.7134H129.766C130.203 19.7134 130.622 19.8871 130.931 20.1962C131.24 20.5053 131.413 20.9245 131.413 21.3617V31.2515C131.413 31.6886 131.24 32.1079 130.931 32.417C130.622 32.7261 130.203 32.8998 129.766 32.8998H121.526C121.259 32.912 120.993 32.8699 120.742 32.7761C120.492 32.6823 120.263 32.5387 120.07 32.3541C119.877 32.1694 119.723 31.9474 119.618 31.7016C119.513 31.4558 119.459 31.1912 119.459 30.9239C119.459 30.6565 119.513 30.392 119.618 30.1461C119.723 29.9003 119.877 29.6784 120.07 29.4937C120.263 29.309 120.492 29.1654 120.742 29.0716C120.993 28.9779 121.259 28.9358 121.526 28.948H128.53V26.2489C128.529 25.5644 128.256 24.9083 127.772 24.4246C127.287 23.941 126.631 23.6693 125.947 23.6693H120.591C118.458 23.7173 116.428 24.5986 114.936 26.1246C113.445 27.6507 112.609 29.7002 112.609 31.8346C112.609 33.9689 113.445 36.0184 114.936 37.5445C116.428 39.0705 118.458 39.9519 120.591 39.9998H129.766C132.091 39.9998 134.32 39.0759 135.964 37.4314C137.608 35.7869 138.532 33.5565 138.532 31.2309V21.3411C138.527 19.019 137.601 16.7939 135.957 15.1538C134.314 13.5138 132.087 12.5928 129.766 12.5928Z" fill="#74BC1F"/><path d="M38.312 12.5928H26.0973C25.1842 12.595 24.3093 12.9593 23.6644 13.6059C23.0195 14.2525 22.6574 15.1285 22.6574 16.0418V19.7134H38.312C38.749 19.7134 39.1682 19.8871 39.4772 20.1962C39.7862 20.5053 39.9598 20.9245 39.9598 21.3617V31.2515C39.9598 31.6886 39.7862 32.1079 39.4772 32.417C39.1682 32.7261 38.749 32.8998 38.312 32.8998H30.0727C29.8057 32.912 29.539 32.8699 29.2887 32.7761C29.0385 32.6823 28.8098 32.5387 28.6165 32.3541C28.4233 32.1694 28.2694 31.9474 28.1643 31.7016C28.0593 31.4558 28.0051 31.1912 28.0051 30.9239C28.0051 30.6565 28.0593 30.392 28.1643 30.1461C28.2694 29.9003 28.4233 29.6784 28.6165 29.4937C28.8098 29.309 29.0385 29.1654 29.2887 29.0716C29.539 28.9779 29.8057 28.9358 30.0727 28.948H37.0761V26.2489C37.075 25.5644 36.8024 24.9083 36.3181 24.4246C35.8338 23.941 35.1774 23.6693 34.4931 23.6693H29.1376C28.0502 23.6449 26.9688 23.838 25.957 24.2374C24.9453 24.6367 24.0235 25.2343 23.2458 25.9949C22.4681 26.7555 21.8501 27.6639 21.4283 28.6667C21.0064 29.6696 20.7891 30.7466 20.7891 31.8346C20.7891 32.9225 21.0064 33.9996 21.4283 35.0024C21.8501 36.0052 22.4681 36.9136 23.2458 37.6742C24.0235 38.4348 24.9453 39.0324 25.957 39.4317C26.9688 39.8311 28.0502 40.0242 29.1376 39.9998H38.312C39.463 39.9998 40.6028 39.773 41.6662 39.3322C42.7296 38.8915 43.6957 38.2455 44.5094 37.4312C45.3232 36.6169 45.9685 35.6502 46.4086 34.5863C46.8487 33.5224 47.075 32.3822 47.0745 31.2309V21.3411C47.0701 19.0194 46.145 16.7943 44.5022 15.1541C42.8594 13.5139 40.6331 12.5928 38.312 12.5928Z" fill="#74BC1F"/><path d="M150.001 11.4966C150.002 12.4023 149.737 13.2883 149.237 14.0441C148.738 14.7998 148.028 15.3917 147.194 15.746C146.361 16.1003 145.442 16.2013 144.551 16.0363C143.661 15.8713 142.839 15.4477 142.188 14.8183C141.537 14.1889 141.085 13.3817 140.89 12.4973C140.694 11.6129 140.764 10.6905 141.089 9.84525C141.415 9.00002 141.982 8.26935 142.72 7.74446C143.458 7.21956 144.334 6.92368 145.239 6.89373C145.856 6.87501 146.47 6.98009 147.046 7.20275C147.621 7.42542 148.147 7.76116 148.591 8.19018C149.035 8.6192 149.388 9.13279 149.63 9.70067C149.872 10.2685 149.999 10.8792 150.001 11.4966ZM141.379 11.4966C141.365 12.0347 141.46 12.57 141.657 13.0708C141.854 13.5715 142.15 14.0276 142.527 14.4118C142.904 14.796 143.354 15.1006 143.851 15.3074C144.347 15.5142 144.881 15.6191 145.419 15.6158C145.957 15.6124 146.489 15.501 146.983 15.2881C147.477 15.0752 147.924 14.7651 148.296 14.3763C148.668 13.9874 148.958 13.5278 149.149 13.0246C149.34 12.5214 149.428 11.985 149.408 11.4471C149.402 10.9185 149.292 10.3962 149.084 9.91057C148.875 9.4249 148.572 8.98551 148.192 8.61789C147.812 8.25028 147.363 7.96175 146.871 7.76906C146.379 7.57636 145.854 7.48333 145.325 7.49535C144.276 7.522 143.279 7.95488 142.542 8.7028C141.806 9.45072 141.389 10.4553 141.379 11.5048V11.4966Z" fill="#74BC1F"/><path d="M144.523 11.7935V14.0105H143.547V8.80599H143.662C144.346 8.80599 145.026 8.80599 145.722 8.80599C146.136 8.79992 146.547 8.87845 146.929 9.03675C147.215 9.14651 147.45 9.35864 147.589 9.63199C147.727 9.90534 147.759 10.2204 147.679 10.5161C147.636 10.7921 147.507 11.0475 147.31 11.2458C147.113 11.4441 146.859 11.5752 146.583 11.6205H146.538L146.517 11.6411L147.662 14.0105C147.304 14.0105 146.958 14.0105 146.612 14.0105C146.579 14.0105 146.538 13.961 146.517 13.9239C146.258 13.3841 146.002 12.8402 145.743 12.3004C145.673 12.152 145.607 12.0037 145.528 11.8595C145.518 11.8411 145.504 11.8253 145.487 11.8132C145.47 11.8011 145.45 11.7929 145.43 11.7894C145.133 11.7894 144.836 11.7935 144.523 11.7935ZM144.523 9.43646V11.1713C144.791 11.1713 145.051 11.1713 145.31 11.1713C145.529 11.1685 145.748 11.1534 145.965 11.126C146.074 11.117 146.18 11.0865 146.277 11.0363C146.374 10.9861 146.459 10.9171 146.529 10.8334C146.616 10.7224 146.672 10.5912 146.694 10.4522C146.715 10.3132 146.7 10.171 146.651 10.0393C146.602 9.90752 146.52 9.79053 146.413 9.69944C146.306 9.60836 146.177 9.5462 146.039 9.51888C145.54 9.43803 145.033 9.4104 144.527 9.43646H144.523Z" fill="#74BC1F"/></g><defs><clipPath id="clip0_20334_14003"><rect width="150" height="40" fill="white"/></clipPath></defs></svg><span class="dev-name">Dragon Q6A</span><span class="dev-sub">QCS6490</span></h1>
-<div class="meta" id="meta">loading...</div>
+<div class="meta" id="meta"><span id="meta-text">loading...</span><button class="theme-btn" id="theme-btn" onclick="toggleTheme()">☀ AMOLED</button></div>
 </header>
 <div class="pills" id="pills"></div>
 <div class="grid" id="grid"></div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
+function toggleTheme(){
+  const r=document.documentElement;
+  const btn=$('theme-btn');
+  if(r.classList.contains('amoled')){r.classList.remove('amoled');btn.textContent='☀ AMOLED';localStorage.setItem('theme','dark')}
+  else{r.classList.add('amoled');btn.textContent='☀ Dark';localStorage.setItem('theme','amoled')}
+}
+if(localStorage.getItem('theme')==='amoled'){document.documentElement.classList.add('amoled');document.addEventListener('DOMContentLoaded',function(){const b=$('theme-btn');if(b)b.textContent='☀ Dark'})}
 function tc(v,g,w){return v>w?'cr':v>g?'wn':'ok'}
 function fmtB(b){if(!b||b<0)return '0 B';if(b<1024)return b.toFixed(0)+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
 function fmtUp(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h'}
@@ -865,7 +959,8 @@ function dualSpark(id,d1,d2,c1,c2,fixed_max){
 
 function render(d){
   // Header
-  $('meta').innerHTML='<span>'+d.ip_lan+'</span><span>'+new Date().toLocaleTimeString()+'</span><span>↑ '+fmtUp(d.uptime)+'</span>';
+  const ipStr = d.ip_lan ? '<span>'+d.ip_lan+'</span>' : '';
+  $('meta-text').innerHTML = ipStr + '<span>'+new Date().toLocaleTimeString()+'</span><span>↑ '+fmtUp(d.uptime)+'</span>';
 
   // Pills
   const cpuC=tc(d.cpu_pct,60,80),ramC=tc(d.ram_pct,75,90),diskC=tc(d.disk_pct,80,90);
@@ -932,13 +1027,72 @@ function render(d){
 
   // ═══ NPU ═══
   const n=d.npu||{};
-  h+='<div class="sec"><h2>NPU — Hexagon v68</h2>';
-  h+='<div class="row"><span class="k">Type</span><span class="val">'+(n.name||'—')+'</span></div>';
-  if(n.cdsp)h+='<div class="row"><span class="k">CDSP (Compute)</span><span class="val '+(n.cdsp.state==='running'?'ok':'wn')+'">'+n.cdsp.state+'</span></div>';
-  if(n.adsp)h+='<div class="row"><span class="k">ADSP (Audio)</span><span class="val '+(n.adsp.state==='running'?'ok':'wn')+'">'+n.adsp.state+'</span></div>';
-  h+='<div class="row"><span class="k">FastRPC</span><span class="val">'+(n.fastrpc&&n.fastrpc.length?n.fastrpc.join(', '):'none')+'</span></div>';
-  if(n.temp)h+='<div class="row"><span class="k">DSP Temp 0</span><span class="val '+tc(n.temp,55,70)+'">'+n.temp+'°C</span></div>';
-  if(n.temp2)h+='<div class="row"><span class="k">DSP Temp 1</span><span class="val '+tc(n.temp2,55,70)+'">'+n.temp2+'°C</span></div>';
+  h+='<div class="sec"><h2>NPU — Hexagon v68 <span class="badge">12 TOPS</span></h2>';
+  
+  // Compact Subsystem Status
+  const cdsp = n.cdsp && n.cdsp.state==='running';
+  const adsp = n.adsp && n.adsp.state==='running';
+  h+='<div class="row"><span class="k">Subsystems</span><span class="val">';
+  h+='<span class="'+(cdsp?'ok':'wn')+'">CDSP</span> / <span class="'+(adsp?'ok':'wn')+'">ADSP</span>';
+  h+='</span></div>';
+
+  // Compact FastRPC
+  const fastrpc = (n.fastrpc&&n.fastrpc.length)?n.fastrpc.join(', '):'none';
+  h+='<div class="row"><span class="k">FastRPC</span><span class="val" style="font-size:10px;color:var(--dim)">'+fastrpc+'</span></div>';
+
+  // Temps
+  if(n.temp || n.temp2) {
+    h+='<div class="row"><span class="k">Temperatures</span><span class="val">';
+    if(n.temp) h+='<span class="'+tc(n.temp,55,70)+'">'+n.temp+'°C</span>';
+    if(n.temp && n.temp2) h+=' <span style="color:var(--dim)">/</span> ';
+    if(n.temp2) h+='<span class="'+tc(n.temp2,55,70)+'">'+n.temp2+'°C</span>';
+    h+='</span></div>';
+  }
+
+  h+='<div class="sep"></div>';
+  
+  // DSP Activity
+  h+='<div class="row"><span class="k">Hardware Status</span><span class="val '+(n.dsp_active?'ok':'wn')+'">'+(n.dsp_active?'ACTIVE':'IDLE')+'</span></div>';
+  if(n.fastrpc_procs&&n.fastrpc_procs.length){
+    n.fastrpc_procs.forEach(function(p){h+='<div class="row"><span class="k">  → Process</span><span class="val">'+p.comm+' ('+p.pid+')</span></div>'})
+  }
+
+  // Synthetic utilization
+  const util=n.inferred_util||0;
+  const utilC=util>50?'wn':util>0?'ok':'';
+  h+='<div class="row"><span class="k">Inferred Load</span><span class="val '+utilC+'">'+util+'%</span></div>';
+  h+=bar(util);
+  h+='<canvas id="ch-npu-util"></canvas>';
+  h+='</div>';
+
+  // ═══ AI AGENT (SOFTWARE) ═══
+  const ag = d.npu && d.npu.agent ? d.npu.agent : {};
+  h+='<div class="sec"><h2>AI Agent <span class="badge">Application Metrics</span></h2>';
+  if(ag.available){
+    h+='<div class="row"><span class="k">Status</span><span class="val ok">Connected</span></div>';
+    h+='<div class="row"><span class="k">Backend</span><span class="val">'+(ag.npu_enabled?'NPU (QNN)':'CPU (ONNX)')+'</span></div>';
+    h+='<div class="sep"></div>';
+    const eps = ag.embed_per_sec ?? 0;
+    const cpm = ag.chunks_per_min ?? 0;
+    h+='<div class="row"><span class="k">Embed/s</span><span class="val pu">'+(eps > 0 ? eps : '—')+'</span></div>';
+    h+='<div class="row"><span class="k">Chunks/min</span><span class="val ac">'+(cpm > 0 ? cpm : '—')+'</span></div>';
+    if(ag.embed_avg_ms) h+='<div class="row"><span class="k">Avg Embed</span><span class="val">'+ag.embed_avg_ms.toFixed(0)+'ms</span></div>';
+    if(ag.extract_avg_ms) h+='<div class="row"><span class="k">Avg Extract</span><span class="val">'+ag.extract_avg_ms.toFixed(0)+'ms</span></div>';
+    h+='<div class="sep"></div>';
+    h+='<div class="row"><span class="k">ChromaDB</span><span class="val ok">'+(ag.total_chunks ? ag.total_chunks.toLocaleString() : '0')+' chunks</span></div>';
+    h+='<div class="row"><span class="k">Symbols</span><span class="val">'+(ag.unique_symbols ?? '—')+'</span></div>';
+    h+='<div class="row"><span class="k">Processed</span><span class="val">'+(ag.processed_today ?? 0)+' (today) / '+(ag.processed_hour ?? 0)+' (hour)</span></div>';
+  } else {
+    h+='<div class="row"><span class="k">Status</span><span class="val wn">Offline</span></div>';
+    h+='<div class="row"><span class="k" style="color:var(--dim)">Backend</span><span class="val" style="color:var(--dim)">—</span></div>';
+    h+='<div class="sep"></div>';
+    h+='<div class="row"><span class="k" style="color:var(--dim)">Embed/s</span><span class="val" style="color:var(--dim)">—</span></div>';
+    h+='<div class="row"><span class="k" style="color:var(--dim)">Chunks/min</span><span class="val" style="color:var(--dim)">—</span></div>';
+    h+='<div class="sep"></div>';
+    h+='<div class="row"><span class="k" style="color:var(--dim)">ChromaDB</span><span class="val" style="color:var(--dim)">—</span></div>';
+    h+='<div class="row"><span class="k" style="color:var(--dim)">Symbols</span><span class="val" style="color:var(--dim)">—</span></div>';
+    h+='<div class="row"><span class="k" style="color:var(--dim)">Processed</span><span class="val" style="color:var(--dim)">—</span></div>';
+  }
   h+='</div>';
 
   // ═══ RAM ═══
@@ -1064,20 +1218,6 @@ function render(d){
   }
   h+='</div></div>';
 
-  // ═══ HEALTH ═══
-  h+='<div class="sec"><h2>Health Check</h2>';
-  if(d.health==='OK'){
-    h+='<div class="h-item"><div class="h-dot g"></div><span class="ok">All systems nominal</span></div>';
-  }else{
-    d.issues.forEach(i=>{
-      const c=i.includes('high')||i.includes('hot')||i.includes('FAIL')||i.includes('No')?'r':'y';
-      h+='<div class="h-item"><div class="h-dot '+c+'"></div><span>'+i+'</span></div>';
-    });
-  }
-  h+='<div class="sep"></div>';
-  h+='<div class="h-item"><div class="h-dot g"></div><span>Uptime: '+fmtUp(d.uptime)+'</span></div>';
-  h+='</div>';
-
   // ═══ DOCKER ═══
   h+='<div class="sec full"><h2>Docker Containers <span class="badge">'+d.container_up+'/'+d.container_total+'</span></h2>';
   h+='<div class="sec-scroll"><table class="ctbl"><thead><tr><th>#</th><th>Container</th><th>Status</th></tr></thead><tbody>';
@@ -1087,7 +1227,31 @@ function render(d){
   });
   h+='</tbody></table></div></div>';
 
-  $('grid').innerHTML=h;
+  if(!$('grid')._tpl) $('grid')._tpl = document.createElement('div');
+  $('grid')._tpl.innerHTML = h;
+  function morph(oldN, newN) {
+    if(oldN.nodeType !== newN.nodeType) { oldN.replaceWith(newN.cloneNode(true)); return; }
+    if(oldN.nodeType === Node.TEXT_NODE) { if(oldN.nodeValue !== newN.nodeValue) oldN.nodeValue = newN.nodeValue; return; }
+    if(oldN.tagName === 'CANVAS') return;
+    const oA = oldN.attributes, nA = newN.attributes;
+    for(let i=oA.length-1; i>=0; i--) if(!newN.hasAttribute(oA[i].name)) oldN.removeAttribute(oA[i].name);
+    for(let i=0; i<nA.length; i++) if(oldN.getAttribute(nA[i].name) !== nA[i].value) oldN.setAttribute(nA[i].name, nA[i].value);
+    const oC = Array.from(oldN.childNodes), nC = Array.from(newN.childNodes);
+    for(let i=0; i<Math.max(oC.length, nC.length); i++) {
+      if(!oC[i]) oldN.appendChild(nC[i].cloneNode(true));
+      else if(!nC[i]) oldN.removeChild(oC[i]);
+      else morph(oC[i], nC[i]);
+    }
+  }
+  if(!$('grid').children.length) $('grid').innerHTML = h;
+  else {
+    const oC = Array.from($('grid').childNodes), nC = Array.from($('grid')._tpl.childNodes);
+    for(let i=0; i<Math.max(oC.length, nC.length); i++) {
+      if(!oC[i]) $('grid').appendChild(nC[i].cloneNode(true));
+      else if(!nC[i]) $('grid').removeChild(oC[i]);
+      else morph(oC[i], nC[i]);
+    }
+  }
 
   // Charts
   setTimeout(()=>{
@@ -1101,18 +1265,27 @@ function render(d){
     dualSpark('ch-net',hi.net_rx,hi.net_tx,'rgb(63,185,80)','rgb(88,166,255)',maxN);
     const maxT=Math.max(...hi.temp.filter(v=>v!=null),60);
     spark('ch-temp',hi.temp,'rgb(210,153,34)',maxT);
+    spark('ch-npu-util',hi.npu_util,'rgb(188,140,255)',100);
   },60);
 }
 
-async function refresh(){
-  try{
-    const r=await fetch('/api');
-    const d=await r.json();
-    render(d);
-  }catch(e){$('meta').textContent='Error: '+e.message}
+function connectStream() {
+  const evtSource = new EventSource('/stream');
+  evtSource.onmessage = function(e) {
+    try {
+      const d = JSON.parse(e.data);
+      render(d);
+    } catch(err) {
+      $('meta-text').textContent = 'Error: ' + err.message;
+    }
+  };
+  evtSource.onerror = function(e) {
+    $('meta-text').textContent = 'Connection lost. Reconnecting...';
+    evtSource.close();
+    setTimeout(connectStream, 3000);
+  };
 }
-refresh();
-setInterval(refresh,2000);
+connectStream();
 </script>
 </body>
 </html>
@@ -1122,12 +1295,28 @@ setInterval(refresh,2000);
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api":
-            data = json.dumps(get_stats())
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(len(LATEST_STATS)))
             self.end_headers()
-            self.wfile.write(data.encode())
+            self.wfile.write(LATEST_STATS.encode())
+        elif self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                # Send immediately upon connect
+                self.wfile.write(f"data: {LATEST_STATS}\n\n".encode())
+                self.wfile.flush()
+                # Wait for updates
+                while True:
+                    time.sleep(2)
+                    self.wfile.write(f"data: {LATEST_STATS}\n\n".encode())
+                    self.wfile.flush()
+            except Exception:
+                pass
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -1141,6 +1330,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=stats_loop, daemon=True).start()
     print(f"System Monitor → http://0.0.0.0:{PORT}")
     server = HTTPServer(("0.0.0.0", PORT), H)
     server.serve_forever()
