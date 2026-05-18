@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Radxa Q6A Monitor — Qualcomm QCS6490 — Port 3999."""
 import json, subprocess, os, time, re, signal, threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from collections import deque
 
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
@@ -1332,5 +1332,5 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     threading.Thread(target=stats_loop, daemon=True).start()
     print(f"System Monitor → http://0.0.0.0:{PORT}")
-    server = HTTPServer(("0.0.0.0", PORT), H)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     server.serve_forever()
