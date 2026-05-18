@@ -101,11 +101,12 @@ The entire UI is embedded as a Python string in `dashboard.py`. Edit the `DASHBO
 - Voltage regulator display names
 - Refresh interval (default 2000ms)
 
-No rebuild needed for UI changes — the volume mount serves edits live.
 
 ## Disclaimer
 
 This is an **unofficial community project** developed individually, can be freely used or repurposed. This is specifically developed to be leveraged on the Radxa Q6A SBC, especially if you are using it on a headless mode. Not affiliated with, endorsed by, or connected to Radxa Computer Co., Ltd. The Radxa logo and name are used for identification purposes only. All trademarks belong to their respective owners.
+
+If there are any issues, please let me know I will try to patch it. 
 
 ## License
 
