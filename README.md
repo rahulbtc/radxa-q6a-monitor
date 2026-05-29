@@ -101,6 +101,8 @@ The entire UI is embedded as a Python string in `dashboard.py`. Edit the `DASHBO
 - Voltage regulator display names
 - Refresh interval (default 2000ms)
 
+Note: Some of the things are hardcoded (like the DNS and other things, since I also have a Raspberry pi, which I am using as a DHCP server, for VPN and Ad blocking, network wide)
+-- Feel free to modify those. 
 
 ## Disclaimer
 
